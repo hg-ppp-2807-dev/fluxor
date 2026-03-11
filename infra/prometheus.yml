@@ -1,0 +1,16 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: 'load-balancer'
+    static_configs:
+      - targets: ['load-balancer:8080']
+
+  - job_name: 'backends'
+    static_configs:
+      - targets: ['backend-1:8081', 'backend-2:8082', 'backend-3:8083']
+
+  - job_name: 'rl-agent'
+    static_configs:
+      - targets: ['rl-agent:5000']
