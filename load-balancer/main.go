@@ -31,6 +31,7 @@ type Server struct {
 	mu           sync.RWMutex
 	latencySum   float64
 	latencyCount int64
+	cpuLoad      float64 // last known CPU utilisation (0-100), updated by ticker
 }
 
 func (s *Server) IsHealthy() bool { return atomic.LoadInt32(&s.Healthy) == 1 }
@@ -52,6 +53,18 @@ func (s *Server) AvgLatency() float64 {
 		return 0
 	}
 	return s.latencySum / float64(s.latencyCount)
+}
+
+func (s *Server) SetCPU(cpu float64) {
+	s.mu.Lock()
+	s.cpuLoad = cpu
+	s.mu.Unlock()
+}
+
+func (s *Server) GetCPU() float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cpuLoad
 }
 
 // ─── Load Balancer ────────────────────────────────────────────────────────────
@@ -156,6 +169,7 @@ func (lb *LoadBalancer) rlDecide() *Server {
 		RequestRate: 0,
 	}
 	for i, s := range lb.servers {
+		state.CPUUtil[i] = s.GetCPU()
 		state.ActiveConns[i] = float64(s.GetConns())
 		state.AvgLatency[i] = s.AvgLatency()
 	}
@@ -291,7 +305,84 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 			if json.Unmarshal(msg, &cmd) == nil {
 				if cmd["type"] == "SET_ALGO" {
 					lb.SetAlgorithm(cmd["algo"])
+					broadcastAlgo(cmd["algo"])
 				}
+			}
+		}
+	}()
+}
+
+// ─── WS Message Types (new: used by dashboard) ────────────────────────────────
+
+// WSRequestMsg is sent after every proxied request.
+type WSRequestMsg struct {
+	Type      string  `json:"type"`      // "request"
+	Server    int     `json:"server"`    // 1-indexed backend id
+	Latency   float64 `json:"latency"`   // ms
+	Algorithm string  `json:"algorithm"` // "rr" | "lc" | "rl"
+}
+
+// WSServerState is the per-server snapshot inside WSMetricsMsg.
+type WSServerState struct {
+	ID      int     `json:"id"`      // 0-indexed
+	CPU     float64 `json:"cpu"`     // 0-100
+	Conns   int64   `json:"conns"`
+	Latency float64 `json:"latency"` // avg ms
+	Alive   bool    `json:"alive"`
+}
+
+// WSMetricsMsg is broadcast every second by the metrics ticker.
+type WSMetricsMsg struct {
+	Type    string          `json:"type"`    // "metrics"
+	Servers []WSServerState `json:"servers"`
+}
+
+// WSAlgoMsg is sent whenever the algorithm changes.
+type WSAlgoMsg struct {
+	Type      string `json:"type"`      // "algo"
+	Algorithm string `json:"algorithm"`
+}
+
+// broadcastRequest fires a "request" WS event immediately after a proxied call.
+func broadcastRequest(serverID int, latencyMs float64, algo string) {
+	msg, err := json.Marshal(WSRequestMsg{
+		Type:      "request",
+		Server:    serverID + 1, // dashboard uses 1-indexed
+		Latency:   latencyMs,
+		Algorithm: algo,
+	})
+	if err == nil {
+		lb.hub.broadcast <- msg
+	}
+}
+
+// broadcastAlgo fires an "algo" WS event when the algorithm is changed.
+func broadcastAlgo(algo string) {
+	msg, err := json.Marshal(WSAlgoMsg{Type: "algo", Algorithm: algo})
+	if err == nil {
+		lb.hub.broadcast <- msg
+	}
+}
+
+// startMetricsTicker publishes a "metrics" WS event every second.
+func startMetricsTicker() {
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			states := make([]WSServerState, len(lb.servers))
+			for i, s := range lb.servers {
+				states[i] = WSServerState{
+					ID:      s.ID,
+					CPU:     s.GetCPU(),
+					Conns:   s.GetConns(),
+					Latency: s.AvgLatency(),
+					Alive:   s.IsHealthy(),
+				}
+			}
+			msg, err := json.Marshal(WSMetricsMsg{Type: "metrics", Servers: states})
+			if err == nil {
+				lb.hub.broadcast <- msg
 			}
 		}
 	}()
@@ -321,13 +412,14 @@ func initMetrics() {
 	prometheus.MustRegister(reqTotal, reqLatency, activeConns)
 }
 
-// ─── Route Event ──────────────────────────────────────────────────────────────
+// ─── Route Event (legacy — kept for backward compat) ──────────────────────────
 
 type ServerState struct {
 	ID         int     `json:"id"`
 	ActiveConn int64   `json:"conns"`
 	AvgLatency float64 `json:"latency_ms"`
 	Healthy    bool    `json:"healthy"`
+	CPU        float64 `json:"cpu"`
 }
 
 type RouteEvent struct {
@@ -342,6 +434,38 @@ type RouteEvent struct {
 
 // Global lb reference needed for WS command handler
 var lb *LoadBalancer
+
+// ─── CPU Poller ───────────────────────────────────────────────────────────────
+// Polls /status on each backend every 2 s and updates the server's cpuLoad.
+
+func startCPUPoller() {
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			for _, s := range lb.servers {
+				go func(srv *Server) {
+					ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+					defer cancel()
+					req, _ := http.NewRequestWithContext(ctx, "GET", srv.URL.String()+"/status", nil)
+					resp, err := http.DefaultClient.Do(req)
+					if err != nil {
+						return
+					}
+					defer resp.Body.Close()
+					var result struct {
+						CPULoad string `json:"cpu_load"`
+					}
+					if json.NewDecoder(resp.Body).Decode(&result) == nil {
+						var cpu float64
+						fmt.Sscanf(result.CPULoad, "%f", &cpu)
+						srv.SetCPU(cpu)
+					}
+				}(s)
+			}
+		}
+	}()
+}
 
 // ─── Main Handler ─────────────────────────────────────────────────────────────
 
@@ -380,7 +504,10 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		go sendRLFeedback(server.ID, latency)
 	}
 
-	// Broadcast WebSocket event
+	// ── New-style WS broadcast (simple "request" event) ──────────────────────
+	broadcastRequest(server.ID, latency, algo)
+
+	// ── Legacy ROUTE_EVENT broadcast (backward compat) ────────────────────────
 	states := make([]ServerState, len(lb.servers))
 	for i, s := range lb.servers {
 		states[i] = ServerState{
@@ -388,6 +515,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 			ActiveConn: s.GetConns(),
 			AvgLatency: s.AvgLatency(),
 			Healthy:    s.IsHealthy(),
+			CPU:        s.GetCPU(),
 		}
 	}
 	event := RouteEvent{
@@ -460,6 +588,8 @@ func main() {
 
 	lb = NewLoadBalancer(backendURLs, rlAgentURL, hub)
 	go healthChecker(lb.servers)
+	startCPUPoller()
+	startMetricsTicker()
 
 	mux := http.NewServeMux()
 
@@ -471,12 +601,20 @@ func main() {
 
 	// Admin API
 	mux.HandleFunc("/admin/algorithm", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		if r.Method == http.MethodPost {
 			var body struct {
 				Algorithm string `json:"algorithm"`
 			}
 			json.NewDecoder(r.Body).Decode(&body)
 			lb.SetAlgorithm(body.Algorithm)
+			broadcastAlgo(body.Algorithm) // notify all dashboard clients
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]string{"algorithm": body.Algorithm})
 			return
@@ -497,6 +635,7 @@ func main() {
 				ActiveConn: s.GetConns(),
 				AvgLatency: s.AvgLatency(),
 				Healthy:    s.IsHealthy(),
+				CPU:        s.GetCPU(),
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")

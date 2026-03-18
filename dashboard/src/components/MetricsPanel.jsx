@@ -1,5 +1,11 @@
 import React from 'react'
-import { LineChart, Line, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts'
+import {
+  LineChart, Line,
+  AreaChart, Area,
+  XAxis, YAxis,
+  CartesianGrid, Tooltip, Legend,
+  ResponsiveContainer,
+} from 'recharts'
 import { useLBStore } from '../store/useLBStore'
 
 const COLORS = ['#22c55e', '#3b82f6', '#f59e0b']
@@ -10,9 +16,13 @@ export default function MetricsPanel() {
   const servers        = useLBStore(s => s.servers)
   const routingCounts  = useLBStore(s => s.routingCounts)
   const totalRequests  = useLBStore(s => s.totalRequests)
+  const rlStats        = useLBStore(s => s.rlStats)
+
+  const epsilonPct = Math.round((rlStats.epsilon ?? 1) * 100)
 
   return (
     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginTop: 16 }}>
+
       {/* Latency Chart */}
       <ChartCard title="Response Latency (ms)">
         <ResponsiveContainer width="100%" height={160}>
@@ -22,8 +32,8 @@ export default function MetricsPanel() {
             <YAxis tick={{ fontSize: 9, fill: '#64748b' }} />
             <Tooltip contentStyle={{ background: '#0f172a', border: '1px solid #1e3a5f', fontSize: 11 }} />
             <Legend iconSize={8} wrapperStyle={{ fontSize: 10 }} />
-            {[0,1,2].map(i => (
-              <Line key={i} type="monotone" dataKey={`s${i}`} name={`Server ${i+1}`}
+            {[0, 1, 2].map(i => (
+              <Line key={i} type="monotone" dataKey={`s${i}`} name={`Server ${i + 1}`}
                 stroke={COLORS[i]} dot={false} strokeWidth={2} connectNulls />
             ))}
           </LineChart>
@@ -31,7 +41,7 @@ export default function MetricsPanel() {
       </ChartCard>
 
       {/* RPS Chart */}
-      <ChartCard title="Requests/sec">
+      <ChartCard title="Requests / sec">
         <ResponsiveContainer width="100%" height={160}>
           <AreaChart data={rpsHistory} margin={{ top: 4, right: 8, left: -20, bottom: 0 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
@@ -48,7 +58,7 @@ export default function MetricsPanel() {
         <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
           <thead>
             <tr style={{ color: '#64748b', borderBottom: '1px solid #1e293b' }}>
-              {['Server','CPU%','Conns','Latency','Requests','Health'].map(h => (
+              {['Server', 'CPU%', 'Conns', 'Latency', 'Requests', 'Health'].map(h => (
                 <th key={h} style={{ padding: '4px 8px', textAlign: 'left', fontWeight: 500 }}>{h}</th>
               ))}
             </tr>
@@ -64,7 +74,11 @@ export default function MetricsPanel() {
                 <td style={{ padding: '6px 8px', color: '#94a3b8' }}>{(s.latency_ms || 0).toFixed(0)}ms</td>
                 <td style={{ padding: '6px 8px', color: '#94a3b8' }}>{routingCounts[s.id] || 0}</td>
                 <td style={{ padding: '6px 8px' }}>
-                  <span style={{ background: s.healthy ? '#166534' : '#7f1d1d', color: s.healthy ? '#4ade80' : '#f87171', padding: '1px 6px', borderRadius: 4, fontSize: 10 }}>
+                  <span style={{
+                    background: s.healthy ? '#166534' : '#7f1d1d',
+                    color: s.healthy ? '#4ade80' : '#f87171',
+                    padding: '1px 6px', borderRadius: 4, fontSize: 10,
+                  }}>
                     {s.healthy ? 'UP' : 'DOWN'}
                   </span>
                 </td>
@@ -78,7 +92,9 @@ export default function MetricsPanel() {
       <ChartCard title="Routing Distribution">
         <div style={{ padding: '8px 0' }}>
           {servers.map(s => {
-            const pct = totalRequests > 0 ? ((routingCounts[s.id] || 0) / totalRequests * 100).toFixed(1) : 0
+            const pct = totalRequests > 0
+              ? ((routingCounts[s.id] || 0) / totalRequests * 100).toFixed(1)
+              : 0
             return (
               <div key={s.id} style={{ marginBottom: 10 }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 3 }}>
@@ -86,7 +102,10 @@ export default function MetricsPanel() {
                   <span style={{ fontSize: 12, color: COLORS[s.id] }}>{pct}% ({routingCounts[s.id] || 0})</span>
                 </div>
                 <div style={{ background: '#1e293b', borderRadius: 4, height: 8 }}>
-                  <div style={{ background: COLORS[s.id], height: 8, borderRadius: 4, width: `${pct}%`, transition: 'width 0.4s ease' }} />
+                  <div style={{
+                    background: COLORS[s.id], height: 8, borderRadius: 4,
+                    width: `${pct}%`, transition: 'width 0.4s ease',
+                  }} />
                 </div>
               </div>
             )
@@ -96,13 +115,71 @@ export default function MetricsPanel() {
           </div>
         </div>
       </ChartCard>
+
+      {/* RL Agent Stats — spans full width */}
+      <ChartCard title="RL Agent — DQN Stats" wide>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 24, padding: '4px 0' }}>
+
+          {/* Epsilon */}
+          <div>
+            <div style={{ fontSize: 11, color: '#64748b', marginBottom: 6 }}>
+              Exploration Rate (ε)
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <div style={{ flex: 1, background: '#1e293b', borderRadius: 4, height: 10 }}>
+                <div style={{
+                  width: `${epsilonPct}%`,
+                  height: 10, borderRadius: 4,
+                  background: epsilonPct > 60 ? '#f59e0b' : epsilonPct > 20 ? '#3b82f6' : '#22c55e',
+                  transition: 'width 0.5s ease',
+                }} />
+              </div>
+              <span style={{ fontSize: 13, fontWeight: 700, color: '#e2e8f0', minWidth: 36 }}>
+                {(rlStats.epsilon ?? 1).toFixed(2)}
+              </span>
+            </div>
+            <div style={{ fontSize: 10, color: '#475569', marginTop: 4 }}>
+              {epsilonPct > 60 ? 'Exploring (random)' : epsilonPct > 20 ? 'Learning' : 'Exploiting (policy)'}
+            </div>
+          </div>
+
+          {/* Avg Reward */}
+          <div>
+            <div style={{ fontSize: 11, color: '#64748b', marginBottom: 6 }}>Avg Reward</div>
+            <div style={{ fontSize: 28, fontWeight: 700, color: rewardColor(rlStats.avgReward) }}>
+              {(rlStats.avgReward ?? 0).toFixed(3)}
+            </div>
+            <div style={{ fontSize: 10, color: '#475569', marginTop: 2 }}>
+              per episode step (higher is better)
+            </div>
+          </div>
+
+          {/* Step Count */}
+          <div>
+            <div style={{ fontSize: 11, color: '#64748b', marginBottom: 6 }}>Training Steps</div>
+            <div style={{ fontSize: 28, fontWeight: 700, color: '#a78bfa' }}>
+              {(rlStats.stepCount ?? 0).toLocaleString()}
+            </div>
+            <div style={{ fontSize: 10, color: '#475569', marginTop: 2 }}>
+              DQN weight updates
+            </div>
+          </div>
+        </div>
+      </ChartCard>
+
     </div>
   )
 }
 
-function ChartCard({ title, children }) {
+function ChartCard({ title, children, wide }) {
   return (
-    <div style={{ background: '#0f172a', border: '1px solid #1e293b', borderRadius: 10, padding: 14 }}>
+    <div style={{
+      background: '#0f172a',
+      border: '1px solid #1e293b',
+      borderRadius: 10,
+      padding: 14,
+      gridColumn: wide ? '1 / -1' : undefined,
+    }}>
       <div style={{ fontSize: 12, fontWeight: 600, color: '#64748b', marginBottom: 10, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
         {title}
       </div>
@@ -114,5 +191,11 @@ function ChartCard({ title, children }) {
 function cpuColor(cpu) {
   if (cpu < 40) return '#22c55e'
   if (cpu < 70) return '#eab308'
+  return '#ef4444'
+}
+
+function rewardColor(reward) {
+  if (reward > -0.1) return '#22c55e'
+  if (reward > -0.5) return '#f59e0b'
   return '#ef4444'
 }

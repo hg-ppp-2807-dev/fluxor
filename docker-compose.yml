@@ -63,6 +63,7 @@ services:
     environment:
       - PROMETHEUS_URL=http://prometheus:9090
       - N_SERVERS=3
+      - PORT=5000           # Flask listens on 5000 (matches internal mapping)
     networks:
       - lb-net
     depends_on:
@@ -123,8 +124,9 @@ services:
     build:
       context: ./dashboard
       args:
-        - VITE_WS_URL=ws://load-balancer:8080/ws
-        - VITE_LB_URL=http://load-balancer:8080
+        # These are consumed by the BROWSER, not Docker — must use localhost
+        - VITE_WS_URL=ws://localhost:8080/ws
+        - VITE_LB_URL=http://localhost:8080
     container_name: dashboard
     ports:
       - "3000:3000"
