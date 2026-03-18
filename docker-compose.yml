@@ -63,13 +63,19 @@ services:
     environment:
       - PROMETHEUS_URL=http://prometheus:9090
       - N_SERVERS=3
-      - PORT=5000           # Flask listens on 5000 (matches internal mapping)
+      - PORT=5000
     networks:
       - lb-net
     depends_on:
       - prometheus
     volumes:
       - ./rl-agent/checkpoints:/app/checkpoints
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5000/health')\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
   # ── Load Balancer ─────────────────────────────────────────────
   load-balancer:
@@ -84,10 +90,14 @@ services:
     networks:
       - lb-net
     depends_on:
-      - backend-1
-      - backend-2
-      - backend-3
-      - rl-agent
+      backend-1:
+        condition: service_started
+      backend-2:
+        condition: service_started
+      backend-3:
+        condition: service_started
+      rl-agent:
+        condition: service_healthy
 
   # ── Monitoring ────────────────────────────────────────────────
   prometheus:

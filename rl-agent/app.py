@@ -3,7 +3,7 @@ RL Agent — DQN-based load balancing decision maker.
 Exposes REST API for the Go load balancer to call.
 """
 
-import os, json, time, random, logging
+import os, json, time, random, logging, threading
 from collections import deque
 from threading import Lock
 
@@ -95,12 +95,11 @@ class DQNAgent:
         self.episode_steps = 0
         self.lock          = Lock()
 
-        self._last_state   = None
-        self._last_action  = None
+        self._thread_local = threading.local()
 
         # Try to load existing checkpoint
         self.load_checkpoint()
-
+        
     def select_action(self, state: np.ndarray) -> int:
         if random.random() < self.epsilon:
             return random.randint(0, ACTION_DIM - 1)
@@ -163,12 +162,15 @@ class DQNAgent:
 
     def load_checkpoint(self):
         if os.path.exists(CKPT_PATH):
-            ck = torch.load(CKPT_PATH, map_location="cpu")
-            self.policy_net.load_state_dict(ck["policy"])
-            self.target_net.load_state_dict(ck["target"])
-            self.epsilon    = ck.get("epsilon", self.epsilon)
-            self.step_count = ck.get("step_count", 0)
-            log.info(f"Checkpoint loaded: step={self.step_count} eps={self.epsilon:.3f}")
+            try:
+                ck = torch.load(CKPT_PATH, map_location="cpu", weights_only=True)
+                self.policy_net.load_state_dict(ck["policy"])
+                self.target_net.load_state_dict(ck["target"])
+                self.epsilon    = ck.get("epsilon", self.epsilon)
+                self.step_count = ck.get("step_count", 0)
+                log.info(f"Checkpoint loaded: step={self.step_count} eps={self.epsilon:.3f}")
+            except Exception as e:
+                log.warning(f"Checkpoint load failed ({e}), starting fresh")
 
 # ── State Builder ─────────────────────────────────────────────
 def build_state(payload: dict) -> np.ndarray:
@@ -251,8 +253,8 @@ def decide():
     action  = agent.select_action(state)
     q_vals  = agent.q_values(state)
 
-    agent._last_state  = state
-    agent._last_action = action
+    agent._thread_local.last_state  = state
+    agent._thread_local.last_action = action
     prom_decides.inc()
 
     return jsonify({"action": action, "q_value": float(max(q_vals))})
@@ -267,11 +269,11 @@ def feedback():
     latency_ms = float(payload.get("latency_ms", 200))
     server_id  = int(payload.get("server_id", 0))
 
-    if agent._last_state is None:
-        return jsonify({"status": "skipped"})
+    prev_state  = getattr(agent._thread_local, 'last_state', None)
+    prev_action = getattr(agent._thread_local, 'last_action', None)
 
-    prev_state  = agent._last_state
-    prev_action = agent._last_action
+    if prev_state is None:
+        return jsonify({"status": "skipped"})
     reward      = compute_reward(prev_state, prev_action, latency_ms)
 
     # Build next state from Prometheus
