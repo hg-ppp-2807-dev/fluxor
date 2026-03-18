@@ -4,10 +4,12 @@ WORKDIR /app
 # Accept build args for URLs
 ARG VITE_WS_URL=ws://localhost:8080/ws
 ARG VITE_LB_URL=http://localhost:8080
+ARG VITE_RL_URL=http://localhost:5005
 
 # Set them as environment variables for build time
 ENV VITE_WS_URL=${VITE_WS_URL}
 ENV VITE_LB_URL=${VITE_LB_URL}
+ENV VITE_RL_URL=${VITE_RL_URL}
 
 COPY package.json ./
 RUN npm install

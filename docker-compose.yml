@@ -64,6 +64,8 @@ services:
       - PROMETHEUS_URL=http://prometheus:9090
       - N_SERVERS=3
       - PORT=5000
+      - SIM_ENABLED=true
+      - SIM_INTERVAL_S=0.1
     networks:
       - lb-net
     depends_on:
@@ -71,7 +73,7 @@ services:
     volumes:
       - ./rl-agent/checkpoints:/app/checkpoints
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5000/health')\" || exit 1"]
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -134,9 +136,9 @@ services:
     build:
       context: ./dashboard
       args:
-        # These are consumed by the BROWSER, not Docker — must use localhost
         - VITE_WS_URL=ws://localhost:8080/ws
         - VITE_LB_URL=http://localhost:8080
+        - VITE_RL_URL=http://localhost:5005
     container_name: dashboard
     ports:
       - "3000:3000"
