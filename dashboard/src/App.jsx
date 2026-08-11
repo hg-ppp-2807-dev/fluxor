@@ -404,13 +404,29 @@ export default function App() {
     };
   },[]); // ← empty — runs once on mount only
 
-  // ── Simulation (only when WS disconnected) ───────────────────────────────────
-  // FIX 4: simulation now produces proper per-server latency entries AND
-  // properly updates RL stats even without a working backend.
-  useEffect(()=>{
-    if (wsConnected){ clearInterval(simRef.current); simRef.current=null; return; }
+  // ── Track whether real traffic data is arriving ─────────────────────────────
+  const lastRealMsgRef = useRef(0);
 
+  // Patch the msgRef handler to track real message arrival
+  const origMsgRef = useRef(null);
+  origMsgRef.current = msgRef.current;
+  msgRef.current = (msg) => {
+    if (msg.type === "request" || msg.type === "ROUTE_EVENT") {
+      lastRealMsgRef.current = Date.now();
+    }
+    origMsgRef.current(msg);
+  };
+
+  // ── Simulation (runs when NO real traffic data is flowing) ─────────────────
+  // Instead of checking wsConnected (which kills sim when Docker is up but idle),
+  // we check whether real WS "request"/"ROUTE_EVENT" messages have arrived
+  // recently. If not, we generate simulated data so graphs are never empty.
+  useEffect(()=>{
     simRef.current=setInterval(()=>{
+      // Skip simulation tick if we received real traffic data in the last 3s
+      const timeSinceReal = Date.now() - lastRealMsgRef.current;
+      if (timeSinceReal < 3000) return;
+
       // Evolve server state
       const srvs=serversRef.current.map(s=>({
         ...s,
@@ -432,7 +448,6 @@ export default function App() {
           next[idx]={...next[idx],reqs:next[idx].reqs+1};
           return next;
         });
-        // FIX 1: push all 3 latency values so chart has 3 continuous lines
         setLatencyHistory(h=>{
           const prev=h[h.length-1]||{};
           const entry={
@@ -456,7 +471,7 @@ export default function App() {
     },600);
 
     return ()=>{ clearInterval(simRef.current); simRef.current=null; };
-  },[wsConnected,spawnPacket]);
+  },[spawnPacket]);
 
   // ── RL agent stats poll (every 2s when in rl mode) ───────────────────────────
   useEffect(()=>{
@@ -501,6 +516,18 @@ export default function App() {
     }
   };
 
+  // Track simulation vs live status for display
+  const [isReceivingTraffic, setIsReceivingTraffic] = useState(false);
+  useEffect(() => {
+    const checkTraffic = setInterval(() => {
+      setIsReceivingTraffic(Date.now() - lastRealMsgRef.current < 3000);
+    }, 1000);
+    return () => clearInterval(checkTraffic);
+  }, []);
+
+  const statusLabel = isReceivingTraffic ? "LIVE" : wsConnected ? "LIVE · SIMULATED" : "SIMULATED";
+  const statusDotClass = isReceivingTraffic ? "connected" : "";
+
   // ── Derived values ────────────────────────────────────────────────────────────
   // FIX 1: compute avg across all 3 servers from the multi-line data
   const avgLatency = latencyHistory.length
@@ -525,8 +552,8 @@ export default function App() {
         <header className="header">
           <div className="header-logo">FLUX<span>OR</span></div>
           <div className="header-status">
-            <div className={`ws-dot ${wsConnected?"connected":""}`}/>
-            <span>{wsConnected?"LIVE":"SIMULATED"}</span>
+            <div className={`ws-dot ${statusDotClass}`}/>
+            <span>{statusLabel}</span>
             <span style={{opacity:0.5}}>|</span>
             <span>ALGO: <strong style={{color:algorithm==="rr"?"#00ffe7":algorithm==="lc"?"#ff6b35":"#a78bfa"}}>{algorithm.toUpperCase()}</strong></span>
             <span style={{opacity:0.5}}>|</span>

@@ -146,3 +146,19 @@ services:
       - lb-net
     depends_on:
       - load-balancer
+
+  # ── Traffic Generator (sends requests so dashboard has live data) ──
+  traffic-gen:
+    image: alpine:3.19
+    container_name: traffic-gen
+    entrypoint: ["/bin/sh", "/scripts/traffic-gen.sh"]
+    environment:
+      - LB_URL=http://load-balancer:8080
+      - RPS=5
+    volumes:
+      - ./scripts:/scripts:ro
+    networks:
+      - lb-net
+    depends_on:
+      - load-balancer
+    restart: unless-stopped

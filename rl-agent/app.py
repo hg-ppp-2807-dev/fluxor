@@ -116,6 +116,7 @@ class DQNAgent:
         self.total_reward  = 0.0
         self.episode_steps = 0
         self.last_loss     = 0.0
+        self.recent_rewards = deque(maxlen=100)  # sliding window for dashboard display
 
         # Thread safety
         self.lock          = threading.Lock()
@@ -137,11 +138,18 @@ class DQNAgent:
             t = torch.FloatTensor(state).unsqueeze(0)
             return self.policy_net(t).squeeze().tolist()
 
+    def avg_recent_reward(self) -> float:
+        """Average of last 100 rewards — responsive metric for dashboard."""
+        if not self.recent_rewards:
+            return 0.0
+        return float(np.mean(self.recent_rewards))
+
     def store_and_train(self, state, action, reward, next_state):
         with self.lock:
             self.buffer.push(state, action, reward, next_state)
             self.total_reward  += reward
             self.episode_steps += 1
+            self.recent_rewards.append(reward)
 
             if len(self.buffer) < self.batch_size:
                 return
@@ -168,7 +176,7 @@ class DQNAgent:
             self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
             prom_epsilon.set(self.epsilon)
-            prom_reward.set(self.total_reward / max(1, self.episode_steps))
+            prom_reward.set(self.avg_recent_reward())
             prom_loss.set(self.last_loss)
 
             if self.step_count % self.target_sync == 0:
@@ -178,7 +186,7 @@ class DQNAgent:
                 self.save_checkpoint()
                 log.info(
                     f"step={self.step_count}  eps={self.epsilon:.3f}  "
-                    f"avg_reward={self.total_reward/max(1,self.episode_steps):.3f}  "
+                    f"avg_reward={self.avg_recent_reward():.3f}  "
                     f"loss={self.last_loss:.4f}  buffer={len(self.buffer)}"
                 )
 
@@ -436,7 +444,7 @@ def status():
         "epsilon":     round(agent.epsilon, 4),
         "step_count":  agent.step_count,
         "buffer_len":  len(agent.buffer),
-        "avg_reward":  round(agent.total_reward / max(1, agent.episode_steps), 4),
+        "avg_reward":  round(agent.avg_recent_reward(), 4),
         "last_loss":   round(agent.last_loss, 6),
         "sim_enabled": SIM_ENABLED,
     })
@@ -448,7 +456,7 @@ def rl_stats():
     return jsonify({
         "type":       "rl_stats",
         "epsilon":    round(agent.epsilon, 4),
-        "avg_reward": round(agent.total_reward / max(1, agent.episode_steps), 4),
+        "avg_reward": round(agent.avg_recent_reward(), 4),
         "step_count": agent.step_count,
         "buffer_len": len(agent.buffer),
         "loss":       round(agent.last_loss, 6),

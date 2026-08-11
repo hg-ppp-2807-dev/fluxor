@@ -175,7 +175,7 @@ func (lb *LoadBalancer) rlDecide() *Server {
 	}
 
 	body, _ := json.Marshal(state)
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
 	req, _ := http.NewRequestWithContext(ctx, "POST", lb.rlAgentURL+"/decide", bytes.NewReader(body))
