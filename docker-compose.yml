@@ -64,7 +64,7 @@ services:
       - PROMETHEUS_URL=http://prometheus:9090
       - N_SERVERS=3
       - PORT=5000
-      - SIM_ENABLED=true
+      - SIM_ENABLED=false
       - SIM_INTERVAL_S=0.1
     networks:
       - lb-net
@@ -73,7 +73,7 @@ services:
     volumes:
       - ./rl-agent/checkpoints:/app/checkpoints
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      test: [ "CMD", "curl", "-f", "http://localhost:5000/health" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -88,7 +88,7 @@ services:
     environment:
       - BACKEND_URLS=http://backend-1:8081,http://backend-2:8082,http://backend-3:8083
       - RL_AGENT_URL=http://rl-agent:5000
-      - ALGORITHM=rr
+      - ALGORITHM=lc
     networks:
       - lb-net
     depends_on:
@@ -151,7 +151,7 @@ services:
   traffic-gen:
     image: alpine:3.19
     container_name: traffic-gen
-    entrypoint: ["/bin/sh", "/scripts/traffic-gen.sh"]
+    entrypoint: [ "/bin/sh", "/scripts/traffic-gen.sh" ]
     environment:
       - LB_URL=http://load-balancer:8080
       - RPS=5

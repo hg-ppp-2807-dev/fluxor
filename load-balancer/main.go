@@ -76,6 +76,8 @@ type LoadBalancer struct {
 	algMu      sync.RWMutex
 	rlAgentURL string
 	hub        *Hub
+	reqCount   int64 // NEW
+	currentRPS int64 // NEW
 }
 
 func NewLoadBalancer(backendURLs []string, rlAgentURL string, hub *Hub) *LoadBalancer {
@@ -149,30 +151,43 @@ type RLState struct {
 	ActiveConns []float64 `json:"active_conns"`
 	AvgLatency  []float64 `json:"avg_latency_ms"`
 	RequestRate float64   `json:"request_rate"`
+	QueueDepth  float64   `json:"queue_depth"`
+	RequestID   string    `json:"request_id"`
 }
 
 type RLResponse struct {
-	Action int     `json:"action"`
-	QValue float64 `json:"q_value"`
+	Action    int     `json:"action"`
+	QValue    float64 `json:"q_value"`
+	RequestID string  `json:"request_id"`
 }
 
-func (lb *LoadBalancer) rlDecide() *Server {
+type RLDecision struct {
+	Server    *Server
+	RequestID string
+}
+
+func (lb *LoadBalancer) rlDecide() RLDecision {
+	requestID := fmt.Sprintf("%d", time.Now().UnixNano())
 	healthy := lb.healthyServers()
 	if len(healthy) == 0 {
-		return nil
+		return RLDecision{}
 	}
 
 	state := RLState{
 		CPUUtil:     make([]float64, len(lb.servers)),
 		ActiveConns: make([]float64, len(lb.servers)),
 		AvgLatency:  make([]float64, len(lb.servers)),
-		RequestRate: 0,
+		RequestRate: float64(atomic.LoadInt64(&lb.currentRPS)),
+		RequestID:   requestID,
 	}
+	var totalConns float64
 	for i, s := range lb.servers {
 		state.CPUUtil[i] = s.GetCPU()
 		state.ActiveConns[i] = float64(s.GetConns())
 		state.AvgLatency[i] = s.AvgLatency()
+		totalConns += state.ActiveConns[i]
 	}
+	state.QueueDepth = totalConns // NEW — proxy for backlog
 
 	body, _ := json.Marshal(state)
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
@@ -184,32 +199,45 @@ func (lb *LoadBalancer) rlDecide() *Server {
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		log.Printf("[LB] RL agent timeout, falling back to RR: %v", err)
-		return lb.roundRobin()
+		return RLDecision{
+			Server: lb.roundRobin(),
+		}
 	}
 	defer resp.Body.Close()
 
 	var rlResp RLResponse
 	if err := json.NewDecoder(resp.Body).Decode(&rlResp); err != nil {
-		return lb.roundRobin()
+		return RLDecision{
+			Server: lb.roundRobin(),
+		}
 	}
 
 	// Map action to actual server (must be healthy)
 	action := rlResp.Action
 	if action >= 0 && action < len(lb.servers) && lb.servers[action].IsHealthy() {
-		return lb.servers[action]
+		return RLDecision{
+			Server:    lb.servers[action],
+			RequestID: rlResp.RequestID,
+		}
 	}
-	return lb.roundRobin()
+	return RLDecision{
+		Server: lb.roundRobin(),
+	}
 }
 
-func (lb *LoadBalancer) SelectServer() (*Server, string) {
+func (lb *LoadBalancer) SelectServer() (*Server, string, string) {
 	algo := lb.GetAlgorithm()
+
 	switch algo {
 	case "lc":
-		return lb.leastConnections(), algo
+		return lb.leastConnections(), algo, ""
+
 	case "rl":
-		return lb.rlDecide(), algo
+		decision := lb.rlDecide()
+		return decision.Server, algo, decision.RequestID
+
 	default:
-		return lb.roundRobin(), "rr"
+		return lb.roundRobin(), "rr", ""
 	}
 }
 
@@ -324,8 +352,8 @@ type WSRequestMsg struct {
 
 // WSServerState is the per-server snapshot inside WSMetricsMsg.
 type WSServerState struct {
-	ID      int     `json:"id"`      // 0-indexed
-	CPU     float64 `json:"cpu"`     // 0-100
+	ID      int     `json:"id"`  // 0-indexed
+	CPU     float64 `json:"cpu"` // 0-100
 	Conns   int64   `json:"conns"`
 	Latency float64 `json:"latency"` // avg ms
 	Alive   bool    `json:"alive"`
@@ -333,13 +361,13 @@ type WSServerState struct {
 
 // WSMetricsMsg is broadcast every second by the metrics ticker.
 type WSMetricsMsg struct {
-	Type    string          `json:"type"`    // "metrics"
+	Type    string          `json:"type"` // "metrics"
 	Servers []WSServerState `json:"servers"`
 }
 
 // WSAlgoMsg is sent whenever the algorithm changes.
 type WSAlgoMsg struct {
-	Type      string `json:"type"`      // "algo"
+	Type      string `json:"type"` // "algo"
 	Algorithm string `json:"algorithm"`
 }
 
@@ -470,7 +498,8 @@ func startCPUPoller() {
 // ─── Main Handler ─────────────────────────────────────────────────────────────
 
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
-	server, algo := lb.SelectServer()
+	atomic.AddInt64(&lb.reqCount, 1) // NEW
+	server, algo, rlRequestID := lb.SelectServer()
 	if server == nil {
 		http.Error(w, "no healthy backends", http.StatusServiceUnavailable)
 		return
@@ -481,6 +510,10 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 	reqID := fmt.Sprintf("req_%d", start.UnixMilli())
+
+	if algo == "rl" && rlRequestID != "" {
+		reqID = rlRequestID
+	}
 
 	proxy := httputil.NewSingleHostReverseProxy(server.URL)
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
@@ -499,15 +532,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	reqTotal.WithLabelValues(fmt.Sprintf("%d", server.ID), algo).Inc()
 	reqLatency.WithLabelValues(fmt.Sprintf("%d", server.ID), algo).Observe(latency)
 
-	// Send feedback to RL agent (non-blocking)
-	if algo == "rl" {
-		go sendRLFeedback(server.ID, latency)
-	}
-
-	// ── New-style WS broadcast (simple "request" event) ──────────────────────
-	broadcastRequest(server.ID, latency, algo)
-
-	// ── Legacy ROUTE_EVENT broadcast (backward compat) ────────────────────────
+	// Build current state of all backend servers
 	states := make([]ServerState, len(lb.servers))
 	for i, s := range lb.servers {
 		states[i] = ServerState{
@@ -518,6 +543,16 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 			CPU:        s.GetCPU(),
 		}
 	}
+
+	// Send feedback to RL agent (non-blocking)
+	if algo == "rl" {
+		go sendRLFeedback(server.ID, latency, reqID, states)
+	}
+
+	// New-style WS broadcast
+	broadcastRequest(server.ID, latency, algo)
+
+	// Legacy ROUTE_EVENT broadcast
 	event := RouteEvent{
 		Type:         "ROUTE_EVENT",
 		RequestID:    reqID,
@@ -527,27 +562,76 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		LatencyMs:    latency,
 		ServerStates: states,
 	}
+
 	if data, err := json.Marshal(event); err == nil {
 		lb.hub.broadcast <- data
 	}
 }
 
-func sendRLFeedback(serverID int, latencyMs float64) {
+func sendRLFeedback(
+	serverID int,
+	latencyMs float64,
+	requestID string,
+	states []ServerState,
+) {
+	cpuUtil := make([]float64, len(states))
+	activeConns := make([]float64, len(states))
+	avgLatency := make([]float64, len(states))
+	var queueDepth float64
+
+	for i, s := range states {
+		cpuUtil[i] = s.CPU
+		activeConns[i] = float64(s.ActiveConn)
+		avgLatency[i] = s.AvgLatency
+		queueDepth += float64(s.ActiveConn)
+	}
+
+	requestRate := float64(atomic.LoadInt64(&lb.currentRPS))
+
 	body, _ := json.Marshal(map[string]interface{}{
 		"server_id":  serverID,
 		"latency_ms": latencyMs,
+		"request_id": requestID,
+		"cpu_util":   cpuUtil,
+		//"active_conns":   activeConns,
+		"avg_latency_ms": avgLatency,
+		"request_rate":   requestRate,
+		//"queue_depth":    queueDepth,
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		100*time.Millisecond,
+	)
 	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, "POST", lb.rlAgentURL+"/feedback", bytes.NewReader(body))
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		"POST",
+		lb.rlAgentURL+"/feedback",
+		bytes.NewReader(body),
+	)
+
+	if err != nil {
+		log.Printf("[LB] feedback request creation failed: %v", err)
+		return
+	}
+
 	req.Header.Set("Content-Type", "application/json")
-	http.DefaultClient.Do(req) //nolint
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Printf("[LB] feedback failed: %v", err)
+		return
+	}
+
+	resp.Body.Close()
 }
 
 // ─── Health Checker ───────────────────────────────────────────────────────────
 
 func healthChecker(servers []*Server) {
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(2 * time.Second) // was: 10 * time.Second — too slow for a live failure demo
 	for range ticker.C {
 		for _, s := range servers {
 			go func(srv *Server) {
@@ -587,6 +671,17 @@ func main() {
 	go hub.Run()
 
 	lb = NewLoadBalancer(backendURLs, rlAgentURL, hub)
+
+	// NEW: reset reqCount into currentRPS every second
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			n := atomic.SwapInt64(&lb.reqCount, 0)
+			atomic.StoreInt64(&lb.currentRPS, n)
+		}
+	}()
+
 	go healthChecker(lb.servers)
 	startCPUPoller()
 	startMetricsTicker()

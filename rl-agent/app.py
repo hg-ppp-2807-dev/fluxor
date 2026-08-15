@@ -48,6 +48,10 @@ SIM_ENABLED  = os.getenv("SIM_ENABLED", "true").lower() == "true"
 SIM_INTERVAL = float(os.getenv("SIM_INTERVAL_S", "0.1"))   # seconds between sim steps
 os.makedirs(CKPT_DIR, exist_ok=True)
 
+# ── Pending Decisions Storage ─────────────────────────────────
+pending_decisions = {}
+pending_decisions_lock = threading.Lock()
+
 
 # ── DQN Model ─────────────────────────────────────────────────
 class DQN(nn.Module):
@@ -234,8 +238,9 @@ def build_state(payload: dict) -> np.ndarray:
         state.append(np.clip(lat  / 2000.0, 0, 1))
 
     req_rate = float(payload.get("request_rate", 0))
+    queue_depth = float(payload.get("queue_depth", 0))
     state.append(np.clip(req_rate / 500.0, 0, 1))
-    state.append(0.0)
+    state.append(np.clip(queue_depth / 100.0, 0, 1))
     return np.array(state, dtype=np.float32)
 
 
@@ -395,48 +400,103 @@ def index():
 
 @app.route("/decide", methods=["POST"])
 def decide():
-    """
-    POST /decide — called by Go load balancer per request.
-    Body:    { cpu_util: [], active_conns: [], avg_latency_ms: [], request_rate: N }
-    Returns: { action: int, q_value: float }
-    """
     payload = request.get_json(force=True) or {}
-    state   = build_state(payload)
-    action  = agent.select_action(state)
-    q_vals  = agent.q_values(state)
 
-    # FIX: thread-local — concurrent requests no longer clobber each other
-    agent._thread_local.last_state  = state
+    request_id = payload.get("request_id")
+
+    state = build_state(payload)
+
+    action = agent.select_action(state)
+    q_vals = agent.q_values(state)
+
+    log.info(
+        f"[RL DECISION] "
+        f"request_id={request_id} "
+        f"state={state.tolist()} "
+        f"action={action} "
+    f"q_values={[round(float(q), 4) for q in q_vals]} "
+    f"max_q={float(max(q_vals)):.4f}"
+)
+
+    # Store state/action in thread-local as fallback
+    agent._thread_local.last_state = state.copy()
     agent._thread_local.last_action = action
+
+    if request_id:
+        with pending_decisions_lock:
+            # Clean up old decisions (> 60s) to prevent memory growth
+            now = time.time()
+            expired = [k for k, v in pending_decisions.items() if now - v["created_at"] > 60]
+            for k in expired:
+                del pending_decisions[k]
+
+            pending_decisions[request_id] = {
+                "state": state.copy(),
+                "action": action,
+                "created_at": now,
+            }
+
     prom_decides.inc()
 
-    return jsonify({"action": action, "q_value": float(max(q_vals))})
+    return jsonify({
+        "action": action,
+        "q_value": float(max(q_vals)),
+        "request_id": request_id,
+    })
+    
 
 
 @app.route("/feedback", methods=["POST"])
 def feedback():
-    """
-    POST /feedback — called by Go after request completes.
-    Body: { server_id: int, latency_ms: float }
-    """
-    payload    = request.get_json(force=True) or {}
+    payload = request.get_json(force=True) or {}
+
+    request_id = payload.get("request_id")
     latency_ms = float(payload.get("latency_ms", 200))
 
-    # FIX: read from thread-local
-    prev_state  = getattr(agent._thread_local, "last_state",  None)
-    prev_action = getattr(agent._thread_local, "last_action", None)
+    if not request_id:
+        return jsonify({
+            "status": "skipped",
+            "reason": "missing request_id"
+        })
 
-    if prev_state is None:
-        return jsonify({"status": "skipped"})
+    with pending_decisions_lock:
+        decision = pending_decisions.pop(request_id, None)
 
-    reward = compute_reward(prev_state, prev_action, latency_ms)
+    if decision is None:
+        return jsonify({
+            "status": "skipped",
+            "reason": "unknown request_id"
+        })
 
-    next_payload = {"cpu_util": [], "active_conns": [], "avg_latency_ms": []}
-    next_state   = build_state(next_payload)
+    prev_state = decision["state"]
+    prev_action = decision["action"]
 
-    agent.store_and_train(prev_state, prev_action, reward, next_state)
-    return jsonify({"status": "ok", "reward": reward})
+    reward = compute_reward(
+        prev_state,
+        prev_action,
+        latency_ms
+    )
 
+    next_payload = {
+    "cpu_util": payload.get("cpu_util", []),
+    "active_conns": payload.get("active_conns", []),
+    "avg_latency_ms": payload.get("avg_latency_ms", [])
+}
+
+    next_state = build_state(next_payload)
+
+    agent.store_and_train(
+        prev_state,
+        prev_action,
+        reward,
+        next_state
+    )
+
+    return jsonify({
+        "status": "ok",
+        "reward": reward,
+        "request_id": request_id
+    })
 
 @app.route("/status", methods=["GET"])
 def status():

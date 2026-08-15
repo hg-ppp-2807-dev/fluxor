@@ -42,6 +42,7 @@ const cpuGauge = new client.Gauge({
 // ── State ─────────────────────────────────────────────────────
 let activeConnections = 0;
 let cpuLoad = 0;
+let stressUntil = 0;
 
 // Simulate CPU measurement
 function measureCPU() {
@@ -57,7 +58,12 @@ function measureCPU() {
 }
 
 setInterval(() => {
-  cpuLoad = measureCPU();
+  if (Date.now() < stressUntil) {
+    cpuLoad = 90;
+  } else {
+    cpuLoad = measureCPU();
+  }
+
   cpuGauge.set({ server_id: SERVER_ID }, cpuLoad);
   activeConnsGauge.set({ server_id: SERVER_ID }, activeConnections);
 }, 2000);
@@ -108,12 +114,14 @@ app.all('/work', async (req, res) => {
 // Stress endpoint — artificially raises CPU to simulate load spikes
 app.post('/stress', async (req, res) => {
   const duration = parseInt(req.query.duration || '5000');
-  const end = Date.now() + Math.min(duration, 30000);
-  // CPU-intensive loop
-  while (Date.now() < end) {
-    Math.sqrt(Math.random() * 1000000);
-  }
-  res.json({ server_id: SERVER_ID, stressed_for_ms: duration });
+  const actualDuration = Math.min(duration, 30000);
+
+  stressUntil = Date.now() + actualDuration;
+
+  res.json({
+    server_id: SERVER_ID,
+    stressed_for_ms: actualDuration
+  });
 });
 
 // Status endpoint
